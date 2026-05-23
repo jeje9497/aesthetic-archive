@@ -1,0 +1,23 @@
+# Local dev server / Claude Code state
+server.ps1
+.claude/
+
+# Flower app (separate prototype, not part of Aesthetic Archive deploy)
+index.html
+main.js
+style.css
+*.mp4
+
+# Original full-size source images (we deploy the compressed JPEGs instead)
+images/*.png
+images/.thumbnail
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+
+# Vercel local
+.vercel/
