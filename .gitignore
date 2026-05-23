@@ -2,13 +2,14 @@
 server.ps1
 .claude/
 
-# Flower app (separate prototype, not part of Aesthetic Archive deploy)
+# Flower app: keep react.html / FlowerHandControl.jsx / *.mp4 (hand-gesture demo).
+# Older standalone flower prototype assets stay excluded.
 flower-index.html
 main.js
 style.css
-*.mp4
-FlowerHandControl.jsx
-react.html
+
+# Vercel build output (regenerated locally)
+vercel-deploy/
 
 # Original full-size source images (we deploy the compressed JPEGs instead)
 images/*.png

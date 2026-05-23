@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flower · Hand Control (React)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body, #root { width: 100%; height: 100%; margin: 0; padding: 0; background: #000; overflow: hidden; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", sans-serif; color: #fff; }
+  </style>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useEffect, useRef, useState } = React;
+
+    const LERP_FACTOR = 0.22;
+    const OPENNESS_SMOOTH = 0.55;
+
+    const HAND_CONNECTIONS_FALLBACK = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],
+      [13,17],[17,18],[18,19],[19,20],
+      [0,17],
+    ];
+
+    const BASE_CHIP = "px-2 py-0.5 rounded-full border ";
+    const STATUS_CLASS = {
+      "대기":   "border-white/20 text-white/70",
+      "꽃 피우기": "border-emerald-400/40 text-emerald-300",
+      "꽃 지우기": "border-rose-400/40 text-rose-300",
+      "중간":   "border-amber-300/40 text-amber-200",
+    };
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const dist = (a, b) => {
+      const dx = a.x - b.x, dy = a.y - b.y, dz = (a.z||0) - (b.z||0);
+      return Math.sqrt(dx*dx + dy*dy + dz*dz);
+    };
+
+    const mapOpennessToTime = (openness, duration) =>
+      Math.max(0, Math.min(duration - 0.02, (1 - openness) * (duration - 0.02)));
+
+    const computeOpenness = (lm) => {
+      const wrist = lm[0];
+      const pairs = [[8,5],[12,9],[16,13],[20,17]];
+      let sum = 0, n = 0;
+      for (const [tip, mcp] of pairs) {
+        const td = dist(lm[tip], wrist), md = dist(lm[mcp], wrist);
+        if (md < 1e-6) continue;
+        const ratio = td / md;
+        sum += clamp((ratio - 1.0) / 1.0, 0, 1);
+        n++;
+      }
+      const thumbRatio = dist(lm[4], wrist) / Math.max(1e-6, dist(lm[2], wrist));
+      sum += clamp((thumbRatio - 1.0) / 1.0, 0, 1) * 0.6;
+      n += 0.6;
+      return n > 0 ? sum / n : 0;
+    };
+
+    function FlowerHandControl() {
+      const flowerRef = useRef(null);
+      const webcamRef = useRef(null);
+      const overlayRef = useRef(null);
+
+      // 핫패스 ref (절대 setState 안 함)
+      const targetTimeRef = useRef(null);
+      const opennessSmoothedRef = useRef(0);
+      const lerpRafRef = useRef(null);
+      const sendRafRef = useRef(null);
+      const sendingRef = useRef(false);
+      const durationRef = useRef(NaN);  // 강제 probe 후 채워짐
+
+      // 상태 UI 도 직접 DOM 업데이트 (리렌더 방지)
+      const chipRef = useRef(null);
+      const pctTextRef = useRef(null);
+      const pctBarRef = useRef(null);
+      const debugRef = useRef(null);
+      const lastChipLabelRef = useRef("대기");
+      const lastPctRef = useRef(-1);
+
+      // 진짜 가끔만 바뀌는 것만 React state
+      const [showStart, setShowStart] = useState(true);
+      const [needPermission, setNeedPermission] = useState(false);
+      const [errorMsg, setErrorMsg] = useState(null);
+      const startHandlerRef = useRef(null);
+
+      useEffect(() => {
+        let mounted = true;
+        let hands = null;
+        let stream = null;
+
+        const drawHand = (lm) => {
+          const overlay = overlayRef.current;
+          if (!overlay) return;
+          const ctx = overlay.getContext("2d");
+          const w = overlay.width, h = overlay.height;
+          const connections =
+            (typeof window.HAND_CONNECTIONS !== "undefined" && window.HAND_CONNECTIONS) ||
+            HAND_CONNECTIONS_FALLBACK;
+          if (typeof window.drawConnectors === "function" && typeof window.drawLandmarks === "function") {
+            window.drawConnectors(ctx, lm, connections, { color: "#7CFFB2", lineWidth: 2 });
+            window.drawLandmarks(ctx, lm, { color: "#FF7C7C", lineWidth: 1, radius: 2 });
+            return;
+          }
+          ctx.strokeStyle = "#7CFFB2"; ctx.lineWidth = 2;
+          for (const [a, b] of connections) {
+            ctx.beginPath();
+            ctx.moveTo(lm[a].x * w, lm[a].y * h);
+            ctx.lineTo(lm[b].x * w, lm[b].y * h);
+            ctx.stroke();
+          }
+          ctx.fillStyle = "#FF7C7C";
+          for (const pt of lm) {
+            ctx.beginPath();
+            ctx.arc(pt.x * w, pt.y * h, 3, 0, 2 * Math.PI);
+            ctx.fill();
+          }
+        };
+
+        // ---- DOM 직접 업데이트 (React state 안 거침) ----
+        const updateStatusDom = (label, openness) => {
+          const pct = Math.round(openness * 100);
+          if (chipRef.current && lastChipLabelRef.current !== label) {
+            chipRef.current.textContent = label;
+            chipRef.current.className = BASE_CHIP + (STATUS_CLASS[label] || STATUS_CLASS["대기"]);
+            lastChipLabelRef.current = label;
+          }
+          if (pctTextRef.current && lastPctRef.current !== pct) {
+            pctTextRef.current.textContent = pct + "%";
+          }
+          if (pctBarRef.current && lastPctRef.current !== pct) {
+            pctBarRef.current.style.width = pct + "%";
+          }
+          lastPctRef.current = pct;
+        };
+
+        const onResults = (results) => {
+          const overlay = overlayRef.current;
+          if (overlay) {
+            const ctx = overlay.getContext("2d");
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+          }
+          const flower = flowerRef.current;
+
+          const duration = durationRef.current;
+
+          if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+            opennessSmoothedRef.current = opennessSmoothedRef.current * OPENNESS_SMOOTH;
+            if (isFinite(duration) && duration > 0) {
+              targetTimeRef.current = mapOpennessToTime(opennessSmoothedRef.current, duration);
+            }
+            updateStatusDom("대기", 0);
+            return;
+          }
+
+          const landmarks = results.multiHandLandmarks[0];
+          drawHand(landmarks);
+
+          const raw = computeOpenness(landmarks);
+          opennessSmoothedRef.current =
+            opennessSmoothedRef.current * OPENNESS_SMOOTH + raw * (1 - OPENNESS_SMOOTH);
+          const openness = opennessSmoothedRef.current;
+
+          if (isFinite(duration) && duration > 0) {
+            targetTimeRef.current = mapOpennessToTime(openness, duration);
+          }
+
+          const pct = Math.round(openness * 100);
+          let label = "중간";
+          if (pct >= 75) label = "꽃 피우기";
+          else if (pct <= 25) label = "꽃 지우기";
+          updateStatusDom(label, openness);
+        };
+
+        // ---- 비디오 currentTime 보간 루프 (시간 throttle) ----
+        const SEEK_INTERVAL_MS = 33;     // ~30fps 로 시킹 호출 제한
+        let lastSeekTs = 0;
+        let lastSeekCount = 0;           // 디버그용
+        let lastSeekedCount = 0;
+
+        const attachSeekGate = (flower) => {
+          flower.addEventListener("seeked", () => { lastSeekedCount++; });
+        };
+
+        const lerpStep = () => {
+          const flower = flowerRef.current;
+          const duration = durationRef.current;
+          const now = performance.now();
+          if (flower && isFinite(duration) && duration > 0) {
+            const fallback = duration - 0.02;
+            const target = targetTimeRef.current != null ? targetTimeRef.current : fallback;
+            const cur = flower.currentTime;
+            const diff = target - cur;
+            if (Math.abs(diff) > 0.005 && now - lastSeekTs >= SEEK_INTERVAL_MS) {
+              const next = clamp(cur + diff * LERP_FACTOR, 0, duration - 0.01);
+              try {
+                flower.currentTime = next;
+                lastSeekTs = now;
+                lastSeekCount++;
+              } catch (e) {}
+            }
+            if (debugRef.current) {
+              debugRef.current.textContent =
+                `dur=${duration.toFixed(2)} cur=${cur.toFixed(2)} tgt=${target.toFixed(2)} seeks=${lastSeekCount}/seeked=${lastSeekedCount}`;
+            }
+          } else if (debugRef.current) {
+            const raw = flower ? flower.duration : "no-video";
+            debugRef.current.textContent = `duration=${raw} (probing…)`;
+          }
+          lerpRafRef.current = requestAnimationFrame(lerpStep);
+        };
+
+        // duration 이 Infinity 인 MP4 를 위한 강제 probe
+        const probeDuration = (flower) => new Promise((resolve) => {
+          const tryRead = () => {
+            if (isFinite(flower.duration) && flower.duration > 0) {
+              resolve(flower.duration);
+              return true;
+            }
+            return false;
+          };
+          if (tryRead()) return;
+          const onMeta = () => { if (tryRead()) cleanup(); };
+          const onTimeUpdate = () => {
+            if (isFinite(flower.duration) && flower.duration > 0) {
+              const d = flower.duration;
+              flower.currentTime = 0;
+              cleanup();
+              resolve(d);
+            }
+          };
+          const cleanup = () => {
+            flower.removeEventListener("loadedmetadata", onMeta);
+            flower.removeEventListener("durationchange", onMeta);
+            flower.removeEventListener("timeupdate", onTimeUpdate);
+          };
+          flower.addEventListener("loadedmetadata", onMeta);
+          flower.addEventListener("durationchange", onMeta);
+          flower.addEventListener("timeupdate", onTimeUpdate);
+          // 끝까지 시킹해서 브라우저가 실제 duration 을 파악하도록 강제
+          const seekFar = () => {
+            try { flower.currentTime = 1e9; } catch (e) {}
+          };
+          if (flower.readyState >= 1) seekFar();
+          else flower.addEventListener("loadedmetadata", seekFar, { once: true });
+        });
+
+        // ---- MediaPipe 에 프레임 보내는 루프 (Camera 유틸 대체) ----
+        const sendLoop = async () => {
+          if (!mounted) return;
+          const webcam = webcamRef.current;
+          if (hands && webcam && webcam.readyState >= 2 && !sendingRef.current) {
+            sendingRef.current = true;
+            try { await hands.send({ image: webcam }); }
+            catch (e) { /* ignore */ }
+            sendingRef.current = false;
+          }
+          sendRafRef.current = requestAnimationFrame(sendLoop);
+        };
+
+        const initVideo = async () => {
+          const flower = flowerRef.current;
+          if (!flower) return;
+          flower.pause();
+          flower.addEventListener("error", () => {
+            console.error("[flower] video error:", flower.error);
+            setErrorMsg("flower1.mp4 를 로드할 수 없습니다. 파일 경로를 확인해주세요.");
+          });
+          attachSeekGate(flower);
+          lerpRafRef.current = requestAnimationFrame(lerpStep);
+          try {
+            const d = await probeDuration(flower);
+            durationRef.current = d;
+            lastSeekTs = 0;
+            console.log("[flower] duration probed:", d);
+          } catch (e) {
+            console.error("[flower] duration probe failed:", e);
+          }
+        };
+
+        const init = async () => {
+          if (typeof window.Hands === "undefined") {
+            setErrorMsg("MediaPipe Hands 가 로드되지 않았습니다. 네트워크 상태를 확인하고 새로고침해주세요.");
+            return;
+          }
+
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { width: 640, height: 480, facingMode: "user" },
+              audio: false,
+            });
+          } catch (err) {
+            if (!mounted) return;
+            setErrorMsg("카메라 접근이 거부되었습니다. 브라우저 주소창의 자물쇠 아이콘에서 카메라 권한을 허용해주세요.");
+            return;
+          }
+          if (!mounted) {
+            stream.getTracks().forEach((t) => t.stop());
+            return;
+          }
+
+          const webcam = webcamRef.current;
+          const overlay = overlayRef.current;
+          if (!webcam || !overlay) return;
+
+          webcam.srcObject = stream;
+          await new Promise((res) => {
+            const onMeta = () => {
+              webcam.removeEventListener("loadedmetadata", onMeta);
+              webcam.play().catch(() => {});
+              overlay.width = webcam.videoWidth || 640;
+              overlay.height = webcam.videoHeight || 480;
+              res();
+            };
+            webcam.addEventListener("loadedmetadata", onMeta);
+          });
+
+          if (!mounted) return;
+
+          hands = new window.Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+          });
+          hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 0,           // 0 으로 낮춰 GPU 부담 ↓
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6,
+            selfieMode: true,
+          });
+          hands.onResults(onResults);
+
+          // MediaPipe Camera 유틸 대신 직접 rAF
+          sendRafRef.current = requestAnimationFrame(sendLoop);
+        };
+
+        // initVideo, init 는 사용자 탭 후에 호출 (iOS Safari 의 user-gesture 요구)
+        startHandlerRef.current = async () => {
+          const flower = flowerRef.current;
+          if (flower) {
+            try {
+              flower.load();
+              await flower.play();
+              flower.pause();
+              console.log("[flower] unlocked via user gesture");
+            } catch (e) {
+              console.warn("[flower] play unlock failed:", e);
+            }
+          }
+          await initVideo();
+          init();
+        };
+
+        // 탭 가시성 복귀 시 webcam play 재시도
+        const onVisibility = () => {
+          if (document.visibilityState === "visible") {
+            const webcam = webcamRef.current;
+            if (webcam && webcam.paused) webcam.play().catch(() => {});
+          }
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+
+        return () => {
+          mounted = false;
+          document.removeEventListener("visibilitychange", onVisibility);
+          if (lerpRafRef.current) cancelAnimationFrame(lerpRafRef.current);
+          if (sendRafRef.current) cancelAnimationFrame(sendRafRef.current);
+          try { hands && hands.close(); } catch (e) {}
+          if (stream) stream.getTracks().forEach((t) => t.stop());
+        };
+      }, []);
+
+      return (
+        <div className="relative h-screen w-full bg-black overflow-hidden text-white font-sans">
+          <video
+            ref={flowerRef}
+            src="flower1_intra.mp4?v=3"
+            muted
+            playsInline
+            webkit-playsinline="true"
+            preload="auto"
+            className="absolute inset-0 h-screen w-full object-cover bg-black"
+          />
+
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-10 px-4 py-2 text-[13px] tracking-wide text-white/85 bg-white/[0.06] border border-white/10 rounded-full backdrop-blur-md select-none pointer-events-none">
+            ✋ 손을 펴면 꽃이 핍니다 &nbsp;·&nbsp; ✊ 주먹을 쥐면 꽃이 집니다
+          </div>
+
+          <div
+            ref={debugRef}
+            className="fixed top-4 left-4 z-10 px-2 py-1 text-[11px] font-mono text-white/60 bg-black/40 border border-white/10 rounded select-none pointer-events-none"
+          >
+            initializing…
+          </div>
+
+          <div className="fixed right-4 bottom-4 w-[220px] z-10 select-none">
+            <div className="relative w-full h-[165px] bg-black overflow-hidden rounded-md border border-white/10">
+              <video
+                ref={webcamRef}
+                autoPlay
+                playsInline
+                muted
+                className="absolute inset-0 w-full h-full object-cover"
+                style={{ transform: "scaleX(-1)" }}
+              />
+              <canvas
+                ref={overlayRef}
+                className="absolute inset-0 w-full h-full pointer-events-none"
+                style={{ transform: "scaleX(-1)" }}
+              />
+            </div>
+            <div className="mt-2 space-y-1">
+              <div className="flex items-center justify-between text-[12px]">
+                <span className="text-white/50">상태</span>
+                <span ref={chipRef} className={BASE_CHIP + STATUS_CLASS["대기"]}>대기</span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-white/50">
+                <span>펼침</span>
+                <span ref={pctTextRef}>0%</span>
+              </div>
+              <div className="h-1 w-full bg-white/10 rounded-full overflow-hidden">
+                <div ref={pctBarRef} className="h-full bg-white/70" style={{ width: "0%" }} />
+              </div>
+            </div>
+          </div>
+
+          {showStart && !errorMsg && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm">
+              <button
+                onClick={async () => {
+                  setShowStart(false);
+                  if (startHandlerRef.current) {
+                    try { await startHandlerRef.current(); } catch (e) { console.error(e); }
+                  }
+                }}
+                className="group flex flex-col items-center gap-4 px-8 py-6 rounded-2xl border border-white/15 bg-white/[0.04] hover:bg-white/[0.08] active:bg-white/[0.12] transition"
+              >
+                <div className="text-3xl">🌸</div>
+                <div className="text-lg font-semibold">탭하여 시작</div>
+                <div className="text-sm opacity-70 leading-relaxed max-w-xs text-center">
+                  손동작으로 꽃을 제어합니다.<br/>
+                  탭 후 카메라 권한을 허용해주세요.
+                </div>
+              </button>
+            </div>
+          )}
+
+          {errorMsg && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/95 text-center px-6">
+              <div className="max-w-md">
+                <div className="text-xl font-semibold mb-2">불러오기 실패</div>
+                <div className="text-sm opacity-75 leading-relaxed">{errorMsg}</div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<FlowerHandControl />);
+  </script>
+</body>
+</html>
