@@ -3,10 +3,12 @@ server.ps1
 .claude/
 
 # Flower app (separate prototype, not part of Aesthetic Archive deploy)
-index.html
+flower-index.html
 main.js
 style.css
 *.mp4
+FlowerHandControl.jsx
+react.html
 
 # Original full-size source images (we deploy the compressed JPEGs instead)
 images/*.png

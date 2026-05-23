@@ -1,6 +1,4 @@
 {
   "cleanUrls": true,
-  "rewrites": [
-    { "source": "/", "destination": "/aesthetic-archive.html" }
-  ]
+  "trailingSlash": false
 }
